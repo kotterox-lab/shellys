@@ -1,0 +1,806 @@
+/************************************************
+ * Shelly Pro 3EM -> Shelly Pro 3
+ * Kuormanhallinta 0-4 varttia / aktiivitunti
+ *
+ * blocked:
+ *   - asetetaan vain ulkoisesta tilanmuutoksesta tai
+ *     oman relekomennon aidosta virheesta/aikakatkaisusta
+ *   - sailyy vartinvaihdossa
+ *   - poistuu tunninvaihdossa
+ *
+ * locked:
+ *   - asetetaan, kun vartin sallittu kayttoaika tayttyy
+ *   - poistuu vartin- ja tunninvaihdossa
+ ************************************************/
+
+const PRO3_IP = "192.168.68.60";
+const UPDATE_MS = 10000;
+const MAX_BUSY_MS = 45000;
+const HTTP_TIMEOUT_S = 10;
+const OWN_COMMAND_TIMEOUT_MS = 20000;
+const ACTIVE_ON_DELAY_MS = 60000;
+const HOUR_BASE_DELAY_MS = 15000;
+const PRICE_RETRY_MS = 60000;
+const ALL_OFF_Wh = 5100;
+const ENERGY_NUMBER_ID = 201;
+const QUARTER_BASE_KEY = "quarter_base";
+
+// Shelly sallii enintaan 5 samanaikaista RPC/HTTP-kutsua.
+// Ylitys kaataa skriptin, joten pidetaan yksi paikka varalla.
+const MAX_INFLIGHT = 4;
+
+// Pro3:n paivaenergiat (Number 200-202) paivittyvat kerran minuutissa.
+const NUMBER_READ_INTERVAL_MS = 60000;
+
+let loads = [
+  {
+    name: "VESI", id: 0, numId: 200, enabled: true,
+    kuormavarttejaTunnissa: 4,
+    activeHours1: [8, 9, 13],
+    activeHours2: [10, 12],
+    onWh: -10, offWh: 30,
+    startMin: 1, dailyWh: 4500,
+    max1: 3, max2: 5,
+    state: false, previous: false, blocked: false, locked: false,
+    accumulatedMs: 0, onSinceMs: 0,
+    pendingTarget: null, pendingSinceMs: 0
+  },
+  {
+    name: "LATTI", id: 1, numId: 201, enabled: true,
+    kuormavarttejaTunnissa: 2,
+    activeHours1: [8, 9, 14],
+    activeHours2: [10, 12, 13],
+    onWh: -15, offWh: 30,
+    startMin: 2, dailyWh: 5000,
+    max1: 10, max2: 15,
+    state: false, previous: false, blocked: false, locked: false,
+    accumulatedMs: 0, onSinceMs: 0,
+    pendingTarget: null, pendingSinceMs: 0
+  },
+  {
+    name: "MASSA", id: 2, numId: 202, enabled: true,
+    kuormavarttejaTunnissa: 0,
+    activeHours1: [9, 14],
+    activeHours2: [10, 11, 12, 13],
+    onWh: -20, offWh: 20,
+    startMin: 3, dailyWh: 5000,
+    max1: 5, max2: 10,
+    state: false, previous: false, blocked: false, locked: false,
+    accumulatedMs: 0, onSinceMs: 0,
+    pendingTarget: null, pendingSinceMs: 0
+  }
+];
+
+let priceHour = -1;
+let cheapestMinute = -1;
+let secondMinute = -1;
+let remainingMinute1 = -1;
+let remainingMinute2 = -1;
+let priceReady = false;
+let priceFetchBusy = false;
+let lastPriceFetchMs = 0;
+
+let quarterBaseDay = "";
+let quarterBaseIndex = -1;
+let quarterBaseWh = 0;
+let quarterBaseReady = false;
+let quarterBaseLoaded = false;
+let quarterBaseNotBeforeMs = 0;
+
+let previousKnown = false;
+let lastHour = null;
+let lastQuarter = null;
+let activeOnBlockedUntilMs = 0;
+let busy = false;
+let busySinceMs = 0;
+let runSequence = 0;
+let activeRunSequence = 0;
+
+let inFlight = 0;                       // kesken olevat kutsut
+let relayQueue = [null, null, null];    // jonossa odottavat relekomennot
+let cachedNumbers = [null, null, null]; // Number 200-202 viimeisin luku
+let lastNumberReadMs = 0;
+
+// Kaikki Shelly.call-kutsut taman kautta. Jos paikkoja ei ole,
+// callback saa heti virheen (-1) eika kutsua tehda.
+function rpc(method, params, callback, userData) {
+  if (inFlight >= MAX_INFLIGHT) {
+    if (callback) callback(null, -1, "rpc limit", userData);
+    return false;
+  }
+
+  inFlight++;
+
+  // userData kulkee closuren kautta, joten Shelly.call saa aina
+  // saman kolmen parametrin muodon.
+  Shelly.call(method, params, function(result, errorCode, errorMessage) {
+    inFlight--;
+    if (inFlight < 0) inFlight = 0;
+    if (callback) callback(result, errorCode, errorMessage, userData);
+    pumpRelayQueue();
+  });
+
+  return true;
+}
+
+function dayKey(d) {
+  return d.getFullYear() + "-" + (d.getMonth() + 1) + "-" + d.getDate();
+}
+
+function two(v) {
+  return v < 10 ? "0" + v : "" + v;
+}
+
+function isNightHour(d) {
+  let h = d.getHours();
+  return h >= 17 || h < 8;
+}
+
+function quarterOfDay(d) {
+  return d.getHours() * 4 + Math.floor(d.getMinutes() / 15);
+}
+
+function quarterStartMinute(d) {
+  return Math.floor(d.getMinutes() / 15) * 15;
+}
+
+function minuteInQuarter(d) {
+  return d.getMinutes() % 15;
+}
+
+function loadHourGroup(load, d) {
+  let h = d.getHours();
+  if (load.activeHours1.indexOf(h) !== -1) return 1;
+  if (load.activeHours2.indexOf(h) !== -1) return 2;
+  return 0;
+}
+
+function isAnyLoadActive(d) {
+  let i;
+  for (i = 0; i < loads.length; i++) {
+    if (loadHourGroup(loads[i], d) !== 0) return true;
+  }
+  return false;
+}
+
+function setRemainingQuarters(first, second) {
+  let m;
+  let found = 0;
+
+  remainingMinute1 = -1;
+  remainingMinute2 = -1;
+
+  for (m = 0; m <= 45; m += 15) {
+    if (m !== first && m !== second) {
+      if (found === 0) remainingMinute1 = m;
+      else remainingMinute2 = m;
+      found++;
+    }
+  }
+}
+
+function quarterRank(load, d) {
+  let count = load.kuormavarttejaTunnissa;
+  let qmin = quarterStartMinute(d);
+
+  if (count < 0) count = 0;
+  if (count > 4) count = 4;
+
+  if (count >= 1 && qmin === cheapestMinute) return 0;
+  if (count >= 2 && qmin === secondMinute) return 1;
+  if (count >= 3 && qmin === remainingMinute2) return 2;
+  if (count >= 4 && qmin === remainingMinute1) return 3;
+
+  return -1;
+}
+
+function quarterMaxMinutes(load, d) {
+  let group = loadHourGroup(load, d);
+  let rank;
+  let minutes;
+  let available;
+
+  if (group === 0 || !priceReady || priceHour !== d.getHours()) return 0;
+
+  rank = quarterRank(load, d);
+  if (rank < 0) return 0;
+
+  minutes = (group === 1 ? load.max1 : load.max2) - rank;
+
+  if (minutes < 0) minutes = 0;
+  if (minutes > 15) minutes = 15;
+
+  available = 15 - load.startMin;
+  if (available < 0) available = 0;
+  if (minutes > available) minutes = available;
+
+  return minutes;
+}
+
+function finishRun(runId) {
+  if (runId === activeRunSequence) busy = false;
+}
+
+function runIsValid(runId) {
+  return runId === activeRunSequence;
+}
+
+function clearPending(load) {
+  load.pendingTarget = null;
+  load.pendingSinceMs = 0;
+}
+
+function clearAllPending() {
+  let i;
+  for (i = 0; i < loads.length; i++) {
+    clearPending(loads[i]);
+    relayQueue[i] = null;
+  }
+}
+
+function pendingMatches(load, actualState) {
+  return load.pendingTarget !== null && load.pendingTarget === actualState;
+}
+
+function updateLoadFromActualState(load, actualState, nowMs) {
+  // Oman komennon tavoitetila saavutettiin.
+  if (pendingMatches(load, actualState)) {
+    clearPending(load);
+    load.state = actualState;
+    return;
+  }
+
+  // Oma komento on viela tuore. Nykyista tilaa ei tulkita ulkoiseksi.
+  if (load.pendingTarget !== null &&
+      nowMs - load.pendingSinceMs <= OWN_COMMAND_TIMEOUT_MS) {
+    load.state = actualState;
+    return;
+  }
+
+  // Oma komento vanheni tavoitetilaa saavuttamatta.
+  if (load.pendingTarget !== null) {
+    clearPending(load);
+    load.blocked = true;
+    load.state = actualState;
+    print("COMMAND TIMEOUT LOCK", load.name, actualState ? "ON" : "OFF");
+    return;
+  }
+
+  // Ilman omaa pending-komentoa tilanmuutos on ulkoinen.
+  if (previousKnown && load.previous !== actualState) {
+    load.blocked = true;
+    print("EXTERNAL LOCK", load.name, actualState ? "ON" : "OFF");
+  }
+
+  load.state = actualState;
+}
+
+function remoteGet(path, callback) {
+  rpc(
+    "HTTP.GET",
+    {
+      url: "http://" + PRO3_IP + "/rpc/" + path,
+      timeout: HTTP_TIMEOUT_S
+    },
+    function(result, errorCode) {
+      let data;
+
+      if (errorCode !== 0 || !result || result.code !== 200 || !result.body) {
+        callback(null);
+        return;
+      }
+
+      try {
+        data = JSON.parse(result.body);
+      } catch (e) {
+        callback(null);
+        return;
+      }
+
+      callback(data);
+    }
+  );
+}
+
+function getPro3Status(callback) {
+  let status = {};
+
+  remoteGet("Switch.GetStatus?id=0", function(s0) {
+    if (!s0) { callback(null); return; }
+    status["switch:0"] = s0;
+
+    remoteGet("Switch.GetStatus?id=1", function(s1) {
+      if (!s1) { callback(null); return; }
+      status["switch:1"] = s1;
+
+      remoteGet("Switch.GetStatus?id=2", function(s2) {
+        if (!s2) { callback(null); return; }
+        status["switch:2"] = s2;
+
+        // Paivaenergiat luetaan vain kerran minuutissa.
+        if (cachedNumbers[0] !== null &&
+            Date.now() - lastNumberReadMs < NUMBER_READ_INTERVAL_MS) {
+          addCachedNumbers(status);
+          callback(status);
+          return;
+        }
+
+        readNumbers(0, function(ok) {
+          if (!ok) { callback(null); return; }
+          lastNumberReadMs = Date.now();
+          addCachedNumbers(status);
+          callback(status);
+        });
+      });
+    });
+  });
+}
+
+function addCachedNumbers(status) {
+  status["number:200"] = cachedNumbers[0];
+  status["number:201"] = cachedNumbers[1];
+  status["number:202"] = cachedNumbers[2];
+}
+
+function readNumbers(i, done) {
+  if (i >= 3) { done(true); return; }
+
+  remoteGet("Number.GetStatus?id=" + (200 + i), function(n) {
+    if (!n) { done(false); return; }
+    cachedNumbers[i] = n;
+    readNumbers(i + 1, done);
+  });
+}
+
+function fetchHourQuarters(hour) {
+  let key;
+
+  if (priceFetchBusy) return;
+
+  priceFetchBusy = true;
+  lastPriceFetchMs = Date.now();
+  priceReady = false;
+  key = "pq" + two(hour);
+
+  remoteGet("KVS.Get?key=pq_day", function(dayData) {
+    if (!dayData || typeof dayData.value !== "string" ||
+        dayData.value !== dayKey(new Date())) {
+      priceFetchBusy = false;
+      return;
+    }
+
+    remoteGet("KVS.Get?key=" + key, function(data) {
+      let parts;
+      let first;
+      let second;
+
+      priceFetchBusy = false;
+
+      if (!data || typeof data.value !== "string") return;
+
+      parts = data.value.split(",");
+      if (parts.length !== 2) return;
+
+      first = Number(parts[0]);
+      second = Number(parts[1]);
+
+      if ((first !== 0 && first !== 15 && first !== 30 && first !== 45) ||
+          (second !== 0 && second !== 15 && second !== 30 && second !== 45) ||
+          first === second || new Date().getHours() !== hour) {
+        return;
+      }
+
+      cheapestMinute = first;
+      secondMinute = second;
+      setRemainingQuarters(first, second);
+      priceHour = hour;
+      priceReady = true;
+    });
+  });
+}
+
+function saveQuarterBase(hourEnergyWh, now) {
+  let value;
+
+  quarterBaseDay = dayKey(now);
+  quarterBaseIndex = quarterOfDay(now);
+  quarterBaseWh = hourEnergyWh;
+  quarterBaseReady = true;
+
+  value = quarterBaseDay + "," + quarterBaseIndex + "," + quarterBaseWh;
+
+  rpc("KVS.Set", {
+    key: QUARTER_BASE_KEY,
+    value: value
+  }, null);
+}
+
+function loadQuarterBase() {
+  quarterBaseLoaded = false;
+
+  rpc("KVS.Get", { key: QUARTER_BASE_KEY }, function(result, errorCode) {
+    let parts;
+    let q;
+    let wh;
+    let now = new Date();
+
+    quarterBaseLoaded = true;
+    quarterBaseReady = false;
+
+    if (errorCode !== 0 || !result || typeof result.value !== "string") return;
+
+    parts = result.value.split(",");
+    if (parts.length !== 3) return;
+
+    q = Number(parts[1]);
+    wh = Number(parts[2]);
+
+    if (parts[0] !== dayKey(now) || q !== quarterOfDay(now) || wh !== wh) return;
+
+    quarterBaseDay = parts[0];
+    quarterBaseIndex = q;
+    quarterBaseWh = wh;
+    quarterBaseReady = true;
+  });
+}
+
+function setRelay(load, targetState) {
+  let nowMs = Date.now();
+
+  // Vanha pending ei saa estaa uutta relekomentoa.
+  if (load.pendingTarget !== null &&
+      nowMs - load.pendingSinceMs > OWN_COMMAND_TIMEOUT_MS) {
+    clearPending(load);
+  }
+
+  // Tuoretta samaa komentoa ei laheteta uudelleen.
+  if (load.pendingTarget !== null && load.pendingTarget === targetState) return;
+
+  load.pendingTarget = targetState;
+  load.pendingSinceMs = nowMs;
+
+  // Komento jonoon. Uudempi komento korvaa saman kuorman vanhan.
+  relayQueue[load.id] = targetState;
+  pumpRelayQueue();
+}
+
+// Lahettaa jonossa olevat relekomennot, kun kutsupaikkoja on vapaana.
+function pumpRelayQueue() {
+  let i;
+  let target;
+
+  for (i = 0; i < relayQueue.length; i++) {
+    if (relayQueue[i] === null) continue;
+    if (inFlight >= MAX_INFLIGHT) return;
+
+    target = relayQueue[i];
+    relayQueue[i] = null;
+
+    // Komennon aikakatkaisu lasketaan todellisesta lahetyshetkesta.
+    if (loads[i].pendingTarget === target) loads[i].pendingSinceMs = Date.now();
+
+    rpc(
+      "HTTP.GET",
+      {
+        url: "http://" + PRO3_IP +
+             "/rpc/Switch.Set?id=" + loads[i].id +
+             "&on=" + (target ? "true" : "false"),
+        timeout: HTTP_TIMEOUT_S
+      },
+      relayDone,
+      {
+        loadIndex: i,
+        target: target
+      }
+    );
+  }
+}
+
+function relayDone(result, errorCode, errorMessage, userData) {
+  let item = loads[userData.loadIndex];
+
+  if (errorCode !== 0 && item.pendingTarget === userData.target) {
+    clearPending(item);
+    item.blocked = true;
+    print("RELAY COMMAND ERROR", item.name, errorCode, errorMessage);
+  }
+}
+
+function switchAllOff() {
+  let i;
+
+  for (i = 0; i < loads.length; i++) {
+    // Tasatunnin OFF on ehdoton.
+    clearPending(loads[i]);
+    setRelay(loads[i], false);
+    loads[i].state = false;
+  }
+}
+
+function resetHourState() {
+  let i;
+
+  for (i = 0; i < loads.length; i++) {
+    loads[i].blocked = false;
+    loads[i].locked = false;
+    loads[i].accumulatedMs = 0;
+    loads[i].onSinceMs = 0;
+  }
+}
+
+function resetQuarterState() {
+  let i;
+
+  for (i = 0; i < loads.length; i++) {
+    loads[i].locked = false;
+    loads[i].accumulatedMs = 0;
+    loads[i].onSinceMs = 0;
+
+    // Ulkoisesti lukittuun kuormaan ei kosketa vartinvaihdossa.
+    if (!loads[i].blocked) {
+      setRelay(loads[i], false);
+      loads[i].state = false;
+    }
+  }
+}
+
+function checkConfiguration() {
+  let i;
+  let load;
+  let ok = true;
+
+  for (i = 0; i < loads.length; i++) {
+    load = loads[i];
+
+    if (load.onWh >= load.offWh) {
+      print("CONFIG ERROR", load.name, "onWh/offWh");
+      ok = false;
+    }
+
+    if (load.startMin < 0 || load.startMin > 14) {
+      print("CONFIG ERROR", load.name, "startMin");
+      ok = false;
+    }
+
+    if (load.max1 < 0 || load.max1 > 15 ||
+        load.max2 < 0 || load.max2 > 15) {
+      print("CONFIG ERROR", load.name, "max1/max2");
+      ok = false;
+    }
+
+    if (load.kuormavarttejaTunnissa < 0 || load.kuormavarttejaTunnissa > 4) {
+      print("CONFIG ERROR", load.name, "kuormavarttejaTunnissa");
+      ok = false;
+    }
+  }
+
+  if (ok) print("Configuration check OK");
+}
+
+function processStatus(status, energyWh, cycleHour, runId) {
+  let now = new Date();
+  let nowMs = Date.now();
+  let allOff = energyWh >= ALL_OFF_Wh;
+  let i;
+  let load;
+  let item;
+  let actualState;
+  let dayKwh;
+  let dayDone;
+  let maxMinutes;
+  let usedMs;
+
+  if (!runIsValid(runId) || isNightHour(now) || now.getHours() !== cycleHour) {
+    finishRun(runId);
+    return;
+  }
+
+  // Paivita reletilat ja tunnista ulkoinen ohjaus.
+  for (i = 0; i < loads.length; i++) {
+    load = loads[i];
+    item = status["switch:" + load.id];
+    actualState = item && typeof item.output === "boolean" ? item.output : false;
+
+    updateLoadFromActualState(load, actualState, nowMs);
+  }
+
+  previousKnown = true;
+
+  // Kayttoaika ja automaattiset OFF-ehdot.
+  for (i = 0; i < loads.length; i++) {
+    load = loads[i];
+    maxMinutes = quarterMaxMinutes(load, now);
+
+    if (load.state) {
+      if (load.onSinceMs === 0) load.onSinceMs = nowMs;
+    } else if (load.onSinceMs !== 0) {
+      load.accumulatedMs += nowMs - load.onSinceMs;
+      load.onSinceMs = 0;
+    }
+
+    usedMs = load.accumulatedMs +
+      (load.state && load.onSinceMs !== 0 ? nowMs - load.onSinceMs : 0);
+
+    if (maxMinutes > 0 && usedMs >= maxMinutes * 60000) {
+      load.locked = true;
+    }
+
+    // blocked suojaa ulkoista ON- ja OFF-tilaa tunnin loppuun.
+    if (load.blocked) continue;
+
+    item = status["number:" + load.numId];
+    dayKwh = item && typeof item.value === "number" ? item.value : null;
+    dayDone = dayKwh !== null && dayKwh * 1000 >= load.dailyWh;
+
+    if (load.state &&
+        (maxMinutes <= 0 || dayDone || energyWh >= load.offWh ||
+         allOff || load.locked)) {
+      setRelay(load, false);
+      load.state = false;
+    }
+  }
+
+  // Automaattiset ON-ehdot.
+  if (!allOff && Date.now() >= activeOnBlockedUntilMs) {
+    now = new Date();
+
+    for (i = 0; i < loads.length; i++) {
+      load = loads[i];
+
+      if (load.blocked || loadHourGroup(load, now) === 0) continue;
+
+      maxMinutes = quarterMaxMinutes(load, now);
+      if (maxMinutes <= 0) continue;
+
+      item = status["number:" + load.numId];
+      dayKwh = item && typeof item.value === "number" ? item.value : null;
+      dayDone = dayKwh !== null && dayKwh * 1000 >= load.dailyWh;
+
+      if (load.enabled && !load.state && !load.locked && !dayDone &&
+          minuteInQuarter(now) >= load.startMin && energyWh < load.onWh) {
+        setRelay(load, true);
+      }
+    }
+  }
+
+  for (i = 0; i < loads.length; i++) {
+    loads[i].previous = loads[i].state;
+  }
+
+  finishRun(runId);
+}
+
+checkConfiguration();
+loadQuarterBase();
+fetchHourQuarters(new Date().getHours());
+
+Timer.set(UPDATE_MS, true, function() {
+  let currentMs = Date.now();
+  let now;
+  let hour;
+  let quarter;
+  let actualHourChange;
+  let runId;
+  let cycleHour;
+
+  if (busy) {
+    if (currentMs - busySinceMs <= MAX_BUSY_MS) return;
+    activeRunSequence++;
+    busy = false;
+  }
+
+  busy = true;
+  busySinceMs = currentMs;
+  runSequence++;
+  runId = runSequence;
+  activeRunSequence = runId;
+
+  now = new Date();
+  hour = now.getHours();
+  quarter = quarterOfDay(now);
+  actualHourChange = lastHour !== null && hour !== lastHour;
+
+  if (isNightHour(now)) {
+    lastHour = hour;
+    lastQuarter = quarter;
+    activeOnBlockedUntilMs = 0;
+    previousKnown = false;
+    clearAllPending();
+    finishRun(runId);
+    return;
+  }
+
+  // Tasatunti: ehdoton OFF, sitten tuntitilojen nollaus.
+  if (lastHour === null || hour !== lastHour) {
+    switchAllOff();
+    resetHourState();
+    previousKnown = false;
+    lastHour = hour;
+    lastQuarter = quarter;
+    quarterBaseNotBeforeMs = Date.now() + HOUR_BASE_DELAY_MS;
+    fetchHourQuarters(hour);
+
+    if (actualHourChange) quarterBaseReady = false;
+
+    activeOnBlockedUntilMs = isAnyLoadActive(now)
+      ? Date.now() + ACTIVE_ON_DELAY_MS
+      : 0;
+
+    finishRun(runId);
+    return;
+  }
+
+  // Vartinvaihto: locked ja kayttoaika nollataan.
+  // blocked-kuormaan ei kosketa.
+  if (lastQuarter === null || quarter !== lastQuarter) {
+    resetQuarterState();
+    lastQuarter = quarter;
+    quarterBaseReady = false;
+    quarterBaseNotBeforeMs = Date.now();
+    finishRun(runId);
+    return;
+  }
+
+  if (!quarterBaseLoaded || !isAnyLoadActive(now)) {
+    finishRun(runId);
+    return;
+  }
+
+  if (!priceReady || priceHour !== hour) {
+    if (!priceFetchBusy && Date.now() - lastPriceFetchMs >= PRICE_RETRY_MS) {
+      fetchHourQuarters(hour);
+    }
+
+    finishRun(runId);
+    return;
+  }
+
+  cycleHour = hour;
+
+  rpc("Number.GetStatus", { id: ENERGY_NUMBER_ID }, function(energyResult) {
+    let checkNow;
+    let hourWh;
+    let quarterWh;
+
+    if (!runIsValid(runId)) return;
+
+    checkNow = new Date();
+
+    if (isNightHour(checkNow) || checkNow.getHours() !== cycleHour ||
+        !energyResult || typeof energyResult.value !== "number") {
+      finishRun(runId);
+      return;
+    }
+
+    hourWh = energyResult.value;
+
+    if (!quarterBaseReady || quarterBaseDay !== dayKey(checkNow) ||
+        quarterBaseIndex !== quarterOfDay(checkNow)) {
+      if (Date.now() < quarterBaseNotBeforeMs) {
+        finishRun(runId);
+        return;
+      }
+
+      saveQuarterBase(hourWh, checkNow);
+      finishRun(runId);
+      return;
+    }
+
+    quarterWh = hourWh - quarterBaseWh;
+
+    getPro3Status(function(status) {
+      let statusNow;
+
+      if (!runIsValid(runId)) return;
+
+      statusNow = new Date();
+
+      if (!status || isNightHour(statusNow) || statusNow.getHours() !== cycleHour) {
+        finishRun(runId);
+        return;
+      }
+
+      processStatus(status, quarterWh, cycleHour, runId);
+    });
+  });
+});
